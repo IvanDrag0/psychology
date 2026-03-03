@@ -1,0 +1,317 @@
+---
+title: "Handling Class Imbalance"
+subtitle: "AI/ML Crash Course — Deep Dive"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Welcome
+
+Many outcomes that matter most in clinical psychology are rare. Only a fraction of adolescents develop clinical eating disorders. Only a small percentage of therapy clients drop out. Only some patients in remission relapse. When the outcome you are trying to predict occurs in, say, 10% of cases, you have a **class imbalance** problem --- and it creates a trap that catches many first-time ML practitioners.
+
+This notebook shows you the trap, explains why it matters for clinical research, and teaches you two practical solutions.
+
+**Prerequisites**: Week 2 R notebook completed.
+
+---
+
+## Setup
+
+```{r install-packages, eval=FALSE}
+install.packages("tidymodels")
+install.packages("tidyverse")
+install.packages("vip")
+install.packages("ranger")
+install.packages("themis")  # for upsampling and downsampling
+```
+
+```{r load-packages}
+library(tidymodels)
+library(tidyverse)
+library(vip)
+library(themis)
+
+set.seed(2024)
+```
+
+---
+
+## Create an Imbalanced Dataset
+
+This is similar to the Week 2 body dissatisfaction dataset, but we adjust the probability threshold to create a much more extreme imbalance. Only about 10% of adolescents will have the positive (clinical dissatisfaction) outcome, which is closer to base rates for many clinical conditions.
+
+```{r simulate-imbalanced}
+n <- 500
+
+imbalanced_data <- tibble(
+  id = 1:n,
+  age = round(runif(n, 12, 17), 1),
+  social_media_hours = round(pmax(0, rnorm(n, 2.5, 1.5)), 1),
+  appearance_content = round(pmin(10, pmax(1, rnorm(n, 5, 2))), 1),
+  maternal_body_talk = round(pmin(7, pmax(1, rnorm(n, 3.5, 1.2))), 1),
+  maternal_warmth = round(pmin(7, pmax(1, rnorm(n, 4.5, 1.0))), 1),
+  peer_pressure = round(pmin(10, pmax(1, rnorm(n, 4, 2))), 1),
+  self_esteem = round(pmin(7, pmax(1, rnorm(n, 4.2, 1.1))), 1),
+  bmi_percentile = round(pmin(99, pmax(5, rnorm(n, 55, 20))))
+)
+
+# Use a higher threshold (5.5 instead of 3.5) to create ~10% positive rate
+imbalanced_data <- imbalanced_data %>%
+  mutate(
+    risk_score = 0.3 * social_media_hours +
+                 0.25 * appearance_content +
+                 0.35 * maternal_body_talk +
+                 -0.2 * maternal_warmth +
+                 -0.3 * self_esteem +
+                 0.01 * bmi_percentile +
+                 0.15 * social_media_hours * (appearance_content / 10) +
+                 ifelse(peer_pressure > 7, 1.2, 0.1 * peer_pressure) +
+                 rnorm(n, 0, 1.2),
+    prob = plogis(risk_score - 5.5),
+    clinical_dissatisfaction = factor(
+      ifelse(rbinom(n, 1, prob) == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  ) %>%
+  select(-risk_score, -prob)
+
+# Check the class distribution
+imbalanced_data %>%
+  count(clinical_dissatisfaction) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+```
+
+Notice the stark imbalance. The vast majority of cases are "No." This is realistic for clinical screening scenarios.
+
+---
+
+## The Accuracy Trap
+
+Let's train a random forest on this imbalanced data the same way we did in Week 2 and see what happens.
+
+```{r baseline-model}
+# Split the data
+data_split <- initial_split(imbalanced_data, prop = 0.75,
+                            strata = clinical_dissatisfaction)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Standard recipe (no resampling correction)
+baseline_recipe <- recipe(clinical_dissatisfaction ~ ., data = train_data) %>%
+  update_role(id, new_role = "ID") %>%
+  step_normalize(all_numeric_predictors())
+
+# Random forest
+rf_spec <- rand_forest(trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+baseline_wf <- workflow() %>%
+  add_recipe(baseline_recipe) %>%
+  add_model(rf_spec)
+
+# Fit and predict
+baseline_fit <- baseline_wf %>% fit(data = train_data)
+baseline_preds <- baseline_fit %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction))
+
+# Confusion matrix
+baseline_preds %>%
+  conf_mat(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+```{r baseline-metrics}
+# Accuracy looks great...
+baseline_preds %>%
+  accuracy(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+```{r baseline-sensitivity}
+# ...but sensitivity tells a different story
+baseline_preds %>%
+  sensitivity(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+> **The trap**: Accuracy is above 90%, which looks impressive. But look at the sensitivity --- it may be very low. The model achieves high accuracy by simply predicting "No" for almost everyone. When 90% of cases are actually "No," a model that always says "No" gets 90% accuracy for free.
+>
+> **Why this is dangerous**: In a clinical screening context, this means the model is missing most of the adolescents who actually need help. A body dissatisfaction screener that catches only 20-30% of true cases is worse than useless --- it creates a false sense that screening is working while the majority of at-risk youth slip through.
+
+---
+
+## Better Metrics for Imbalanced Data
+
+Accuracy is not the right metric when classes are imbalanced. Here are the metrics that matter:
+
+```{r better-metrics}
+baseline_full_metrics <- baseline_preds %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class) %>%
+  bind_rows(
+    baseline_preds %>% sensitivity(truth = clinical_dissatisfaction,
+                                    estimate = .pred_class),
+    baseline_preds %>% specificity(truth = clinical_dissatisfaction,
+                                    estimate = .pred_class),
+    baseline_preds %>% bal_accuracy(truth = clinical_dissatisfaction,
+                                     estimate = .pred_class)
+  )
+
+baseline_full_metrics %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity", "bal_accuracy")) %>%
+  select(.metric, .estimate) %>%
+  knitr::kable(digits = 3, col.names = c("Metric", "Value"))
+```
+
+- **Sensitivity** (true positive rate): Of the adolescents who actually have clinical dissatisfaction, what fraction did we catch? This is the most critical metric for screening.
+- **Specificity** (true negative rate): Of the adolescents who are fine, what fraction did we correctly leave alone?
+- **Balanced accuracy**: The average of sensitivity and specificity. This gives equal weight to both classes regardless of how common they are.
+
+---
+
+## Solution 1: Upsampling
+
+**Upsampling** duplicates observations from the minority class (the rare "Yes" cases) so that the model sees an equal number of positive and negative examples during training. The test set remains untouched.
+
+```{r upsample-model}
+# Recipe with upsampling
+upsample_recipe <- recipe(clinical_dissatisfaction ~ ., data = train_data) %>%
+  update_role(id, new_role = "ID") %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_upsample(clinical_dissatisfaction, over_ratio = 1, seed = 2024)
+
+upsample_wf <- workflow() %>%
+  add_recipe(upsample_recipe) %>%
+  add_model(rf_spec)
+
+upsample_fit <- upsample_wf %>% fit(data = train_data)
+upsample_preds <- upsample_fit %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction))
+
+# Check the confusion matrix
+upsample_preds %>%
+  conf_mat(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+```{r upsample-metrics}
+upsample_full <- upsample_preds %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class) %>%
+  bind_rows(
+    upsample_preds %>% sensitivity(truth = clinical_dissatisfaction,
+                                    estimate = .pred_class),
+    upsample_preds %>% specificity(truth = clinical_dissatisfaction,
+                                    estimate = .pred_class),
+    upsample_preds %>% bal_accuracy(truth = clinical_dissatisfaction,
+                                     estimate = .pred_class)
+  )
+
+upsample_full %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity", "bal_accuracy")) %>%
+  select(.metric, .estimate) %>%
+  knitr::kable(digits = 3, col.names = c("Metric", "Value"))
+```
+
+> **What changed?** Sensitivity should improve noticeably --- the model is now catching more true positive cases. Accuracy may drop slightly because the model is making more false positive predictions, but this is a worthwhile tradeoff when missing true cases has serious consequences.
+
+---
+
+## Solution 2: Downsampling
+
+**Downsampling** takes the opposite approach: instead of duplicating minority cases, it randomly removes majority cases so both classes are equally represented. This means the model trains on less data overall, but each class gets equal attention.
+
+```{r downsample-model}
+# Recipe with downsampling
+downsample_recipe <- recipe(clinical_dissatisfaction ~ ., data = train_data) %>%
+  update_role(id, new_role = "ID") %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_downsample(clinical_dissatisfaction, under_ratio = 1, seed = 2024)
+
+downsample_wf <- workflow() %>%
+  add_recipe(downsample_recipe) %>%
+  add_model(rf_spec)
+
+downsample_fit <- downsample_wf %>% fit(data = train_data)
+downsample_preds <- downsample_fit %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction))
+
+downsample_preds %>%
+  conf_mat(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+```{r downsample-metrics}
+downsample_full <- downsample_preds %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class) %>%
+  bind_rows(
+    downsample_preds %>% sensitivity(truth = clinical_dissatisfaction,
+                                      estimate = .pred_class),
+    downsample_preds %>% specificity(truth = clinical_dissatisfaction,
+                                      estimate = .pred_class),
+    downsample_preds %>% bal_accuracy(truth = clinical_dissatisfaction,
+                                       estimate = .pred_class)
+  )
+
+downsample_full %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity", "bal_accuracy")) %>%
+  select(.metric, .estimate) %>%
+  knitr::kable(digits = 3, col.names = c("Metric", "Value"))
+```
+
+---
+
+## Side-by-Side Comparison
+
+Let's put all three approaches next to each other to see the tradeoffs clearly.
+
+```{r comparison-table}
+# Combine all results
+all_results <- bind_rows(
+  baseline_full_metrics %>% mutate(approach = "Original (no correction)"),
+  upsample_full %>% mutate(approach = "Upsampled"),
+  downsample_full %>% mutate(approach = "Downsampled")
+) %>%
+  filter(.metric %in% c("accuracy", "sensitivity", "specificity", "bal_accuracy"))
+
+all_results %>%
+  select(approach, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  select(approach, accuracy, bal_accuracy, sensitivity, specificity) %>%
+  knitr::kable(
+    digits = 3,
+    col.names = c("Approach", "Accuracy", "Balanced Acc.", "Sensitivity", "Specificity")
+  )
+```
+
+> **The tradeoff**: The original model has the highest raw accuracy but the worst sensitivity. The resampled models sacrifice some accuracy and specificity to dramatically improve sensitivity. In clinical screening, this is almost always the right tradeoff --- it is better to flag some false positives (who can be screened out with further assessment) than to miss true cases entirely.
+
+---
+
+## When to Use What
+
+**Upsampling** works well when you have a small dataset and cannot afford to lose any data. Because it duplicates minority observations, the training set grows. The risk is that the model may overfit to the specific minority examples it sees repeated many times.
+
+**Downsampling** works well when you have a large dataset and can afford to discard some majority-class observations. It keeps the training data diverse but smaller. The risk is that you may throw away useful information from the majority class.
+
+**SMOTE** (Synthetic Minority Oversampling Technique) is a more sophisticated alternative that creates *new, synthetic* minority observations by interpolating between existing ones, rather than duplicating them. The `themis` package provides `step_smote()` if you want to try it. SMOTE often outperforms simple upsampling, but it adds complexity and assumptions about the feature space.
+
+In practice, try all three and compare them with cross-validation. There is no universal best choice --- it depends on your data, your sample size, and the relative cost of false positives versus false negatives in your specific application.
+
+---
+
+## Reflection
+
+Class imbalance is not just a technical problem --- it is an ethical one.
+
+Consider what happens when an eating disorder screening model is deployed in a school setting. If the model was trained on imbalanced data without correction, it will have high accuracy but low sensitivity. School counselors will believe the screening is working because the overall numbers look good. Meanwhile, the majority of students who actually need help are being classified as fine.
+
+This is the kind of silent failure that can cause real harm. The model is not obviously broken --- it is just systematically missing the people who matter most.
+
+**Questions to sit with**:
+
+- In your research area, what is the base rate of the outcome you care about? Is class imbalance a factor?
+- What is the relative cost of a false positive versus a false negative in your context? A false positive eating disorder flag means an unnecessary follow-up conversation. A false negative means a student in crisis goes unnoticed.
+- If you were presenting this model to a school board, how would you explain why 85% accuracy with good sensitivity is better than 92% accuracy with poor sensitivity?
+
+For more on the ethical dimensions of predictive models in clinical settings, see the ethics discussion in `week-2-guide.md`.

@@ -1,0 +1,32 @@
+# MkDocs build artifacts
+site/
+
+# Python virtual environment (common practice)
+env/
+venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Editor/OS specific files (examples)
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

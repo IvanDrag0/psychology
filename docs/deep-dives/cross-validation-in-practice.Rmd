@@ -1,0 +1,268 @@
+---
+title: "Cross-Validation in Practice"
+subtitle: "AI/ML Crash Course — Deep Dive"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Welcome
+
+In the Week 2 R notebook, you evaluated your models using a single 75/25 train/test split. That is a reasonable starting point, but it leaves an uncomfortable question: *what if you got lucky (or unlucky) with which data ended up in the test set?*
+
+**Cross-validation** answers this by splitting the data multiple times, training and testing on each split, and averaging the results. It gives you a more stable, trustworthy estimate of how your model will perform on new data.
+
+This notebook takes the same body dissatisfaction dataset from Week 2 and walks you through cross-validation step by step.
+
+**Prerequisites**: Week 2 R notebook completed.
+
+---
+
+## Setup
+
+```{r install-packages, eval=FALSE}
+install.packages("tidymodels")
+install.packages("tidyverse")
+install.packages("vip")
+install.packages("ranger")
+```
+
+```{r load-packages}
+library(tidymodels)
+library(tidyverse)
+library(vip)
+
+set.seed(2024)
+```
+
+---
+
+## Recreate the Dataset
+
+This is the same simulated data from `week-2-r-notebook.Rmd`. We reproduce it here so this notebook is self-contained. The data includes nonlinear effects --- a social media by appearance content interaction and a peer pressure threshold above 7 --- that give tree-based models an advantage over logistic regression.
+
+```{r simulate-data}
+n <- 500
+
+body_image_data <- tibble(
+  id = 1:n,
+  age = round(runif(n, 12, 17), 1),
+  social_media_hours = round(pmax(0, rnorm(n, 2.5, 1.5)), 1),
+  appearance_content = round(pmin(10, pmax(1, rnorm(n, 5, 2))), 1),
+  maternal_body_talk = round(pmin(7, pmax(1, rnorm(n, 3.5, 1.2))), 1),
+  maternal_warmth = round(pmin(7, pmax(1, rnorm(n, 4.5, 1.0))), 1),
+  peer_pressure = round(pmin(10, pmax(1, rnorm(n, 4, 2))), 1),
+  self_esteem = round(pmin(7, pmax(1, rnorm(n, 4.2, 1.1))), 1),
+  bmi_percentile = round(pmin(99, pmax(5, rnorm(n, 55, 20))))
+)
+
+body_image_data <- body_image_data %>%
+  mutate(
+    risk_score = 0.3 * social_media_hours +
+                 0.25 * appearance_content +
+                 0.35 * maternal_body_talk +
+                 -0.2 * maternal_warmth +
+                 -0.3 * self_esteem +
+                 0.01 * bmi_percentile +
+                 0.15 * social_media_hours * (appearance_content / 10) +
+                 ifelse(peer_pressure > 7, 1.2, 0.1 * peer_pressure) +
+                 rnorm(n, 0, 1.2),
+    prob = plogis(risk_score - 3.5),
+    clinical_dissatisfaction = factor(
+      ifelse(rbinom(n, 1, prob) == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  ) %>%
+  select(-risk_score, -prob)
+```
+
+```{r shared-recipe}
+# Same recipe from Week 2
+# Note: the `data` argument in recipe() is only used to learn variable names
+# and types -- it does NOT fit any preprocessing steps. The actual normalization
+# parameters (means, SDs) are estimated fresh within each CV fold during
+# fit_resamples(), so there is no data leakage here.
+body_image_recipe <- recipe(clinical_dissatisfaction ~ ., data = body_image_data) %>%
+  update_role(id, new_role = "ID") %>%
+  step_normalize(all_numeric_predictors())
+```
+
+---
+
+## Single Split Results (Recap)
+
+First, a quick recap of the single-split approach from Week 2. This gives us a baseline to compare against.
+
+```{r single-split}
+# 75/25 split
+data_split <- initial_split(body_image_data, prop = 0.75,
+                            strata = clinical_dissatisfaction)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+# Random forest on a single split
+rf_spec <- rand_forest(trees = 500) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_recipe(body_image_recipe) %>%
+  add_model(rf_spec)
+
+rf_single <- rf_wf %>%
+  fit(data = train_data) %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction)) %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class)
+
+rf_single
+```
+
+This gives us one estimate of accuracy. But how much would this number change if we had drawn a different random split?
+
+---
+
+## 10-Fold Cross-Validation
+
+Cross-validation works by dividing the data into **folds** (subsets). For 10-fold CV, the data is split into 10 roughly equal parts. The model trains on 9 folds and tests on the remaining fold. This rotates 10 times, so every observation gets to be in the test set exactly once.
+
+```{r create-folds}
+# Create 10 folds, stratified by the outcome
+cv_folds <- vfold_cv(body_image_data, v = 10, strata = clinical_dissatisfaction)
+
+cv_folds
+```
+
+Each row above is one fold. The "Fold" column shows which fold is held out for testing. Now we fit the random forest on each fold.
+
+```{r fit-cv}
+# Fit the random forest across all 10 folds
+rf_cv_results <- rf_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+
+# Average performance across the 10 folds
+collect_metrics(rf_cv_results)
+```
+
+> **What to notice**: The `mean` column is the average metric across all 10 folds, and `std_err` tells you how much variation there was. This is a much more informative picture than a single number from one split. If the standard error is small, your estimate is stable. If it is large, your single-split result could have been misleading.
+
+---
+
+## Visualizing Fold-by-Fold Results
+
+Averages are useful, but looking at the individual fold results reveals how much variability exists.
+
+```{r fold-results, fig.width=7, fig.height=4}
+# Extract per-fold metrics
+fold_metrics <- collect_metrics(rf_cv_results, summarize = FALSE)
+
+# Plot accuracy across folds
+fold_metrics %>%
+  filter(.metric == "accuracy") %>%
+  ggplot(aes(x = id, y = .estimate)) +
+  geom_point(size = 3, color = "steelblue") +
+  geom_hline(
+    yintercept = collect_metrics(rf_cv_results) %>%
+      filter(.metric == "accuracy") %>% pull(mean),
+    linetype = "dashed", color = "gray40"
+  ) +
+  labs(
+    title = "Random Forest Accuracy Across 10 Folds",
+    subtitle = "Dashed line = average across folds",
+    x = "Fold",
+    y = "Accuracy"
+  ) +
+  theme_minimal() +
+  ylim(0.5, 1.0)
+```
+
+> **Interpretation**: Each dot is the accuracy from one fold. The spread tells you how sensitive your results are to which data is in the test set. A tight cluster means your model performs consistently. A wide spread means the single-split estimate you got in Week 2 could have been optimistic or pessimistic depending on the random draw.
+
+---
+
+## Repeated Cross-Validation
+
+If 10-fold CV gives you 10 estimates, **repeated CV** gives you even more. By repeating the entire 10-fold process 3 times (with different random splits each time), you get 30 estimates instead of 10.
+
+```{r repeated-cv}
+# 10-fold CV repeated 3 times
+cv_repeated <- vfold_cv(body_image_data, v = 10, repeats = 3,
+                        strata = clinical_dissatisfaction)
+
+rf_repeated_results <- rf_wf %>%
+  fit_resamples(
+    resamples = cv_repeated,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+
+collect_metrics(rf_repeated_results)
+```
+
+Notice how the standard error shrinks with more resamples. The estimate becomes more precise --- you can be more confident in the reported performance. In practice, 10-fold CV with 3-5 repeats is a common default for published ML research.
+
+---
+
+## Comparing Models with CV
+
+The real power of cross-validation is that it gives you a fair way to compare models. Let's run both logistic regression and random forest through the same CV procedure and see which performs better on this data.
+
+```{r compare-models}
+# Logistic regression specification
+logistic_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+logistic_wf <- workflow() %>%
+  add_recipe(body_image_recipe) %>%
+  add_model(logistic_spec)
+
+# Run both models through the same 10-fold CV
+logistic_cv <- logistic_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+
+rf_cv <- rf_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+
+# Collect and combine results
+comparison <- bind_rows(
+  collect_metrics(logistic_cv) %>% mutate(model = "Logistic Regression"),
+  collect_metrics(rf_cv) %>% mutate(model = "Random Forest")
+)
+
+comparison %>%
+  select(model, .metric, mean, std_err) %>%
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) %>%
+  knitr::kable(digits = 3)
+```
+
+> **Why the random forest should win here**: The simulated data contains nonlinear effects (the social media by appearance content interaction) and a threshold effect (peer pressure jumping above 7). Logistic regression assumes linear, additive relationships and cannot capture these patterns without manually specifying interaction terms. The random forest discovers them automatically by splitting the data at informative cutpoints. This is exactly the kind of scenario where ML methods earn their keep.
+
+---
+
+## Reflection
+
+Take a moment to think about what cross-validation gives you:
+
+1. **Honesty**: A single train/test split can be misleadingly good or bad. CV averages over many splits, giving you a performance estimate you can actually trust.
+
+2. **Stability**: The standard error tells you how much your results depend on the particular data split. Small standard errors mean your findings are robust.
+
+3. **Fair comparison**: When comparing models, CV ensures both models are evaluated on the same folds. This is the principled way to claim one model outperforms another.
+
+**Questions to sit with**:
+
+- In your own research, when you report a model's performance (whether it is an SEM fit index, a regression R-squared, or a classification accuracy), how confident are you that the number would hold up with different data?
+- If you were submitting an ML paper to a psychology journal, how would you describe the cross-validation procedure to reviewers who may not be familiar with it?
+
+**For a conceptual review** of why cross-validation works and when to use different variants, see `cross-validation-explained.md` in this deep-dives folder.

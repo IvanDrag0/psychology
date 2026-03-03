@@ -1,0 +1,3 @@
+mkdocs-material>=9.0
+mkdocs-jupyter
+click==8.2.1

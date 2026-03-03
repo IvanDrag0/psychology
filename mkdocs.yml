@@ -1,0 +1,87 @@
+site_name: AI/ML Crash Course for Psychology Researchers
+site_description: A 4-week curriculum for conceptual fluency and career positioning — not deep technical mastery.
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - toc.integrate
+    - content.code.copy
+
+plugins:
+  - search
+  - offline
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tabbed:
+      alternate_style: true
+  - abbr
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.snippets:
+      auto_append:
+        - docs/includes/abbreviations.md
+
+nav:
+  - Home: index.md
+  - AI Tutor: ai-tutor.md
+  - "Week 1: See It In Action":
+      - Guide: week-1/index.md
+      - Hands-On Explorations: week-1/explorations.md
+      - Terminology Glossary: week-1/glossary.md
+  - "Week 2: Understand the Landscape":
+      - Guide: week-2/index.md
+      - Hands-On Explorations: week-2/explorations.md
+  - "Week 3: Position Yourself":
+      - Guide: week-3/index.md
+      - Hands-On Explorations: week-3/explorations.md
+      - Templates and Language: week-3/templates.md
+  - "Week 4: Bring It All Together":
+      - Guide: week-4/index.md
+      - Hands-On Explorations: week-4/explorations.md
+  - Deep Dives:
+      - Overview: deep-dives/index.md
+      - Cross-Validation Explained: deep-dives/cross-validation-explained.md
+      - Reading ML Papers: deep-dives/reading-ml-papers.md
+      - Python Orientation: deep-dives/python-orientation.md
+      - Prompt Engineering: deep-dives/prompt-engineering.md
+      - LLMs as Research Tools: deep-dives/llms-as-research-tools.md
+      - Self-Check Answer Keys: deep-dives/self-check-answer-keys.md
+      - R Notebooks: deep-dives/r-notebooks.md
+  - Resources:
+      - Reading List: supplementary/reading-list.md
+      - Complete Glossary: supplementary/complete-glossary.md
+      - Interview Prep Guide: supplementary/interview-prep-guide.md
+      - Honesty Calibration: supplementary/honesty-calibration.md
+      - Collaboration Guide: supplementary/collaboration-guide.md

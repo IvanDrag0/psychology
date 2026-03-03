@@ -1,0 +1,332 @@
+---
+title: "Your First NLP Analysis in R"
+subtitle: "AI/ML Crash Course — Deep Dive"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Welcome
+
+Natural language processing (NLP) is one of the most exciting intersections of AI and psychology. Psychologists work with text constantly --- open-ended survey responses, therapy transcripts, social media posts, clinical notes --- but we usually analyze it by hand. This notebook introduces **computational text analysis** in R using the `quanteda` package.
+
+You will not be building an ML classifier here. Instead, you will explore what text data looks like to a computer, and you will try some foundational NLP techniques that scale up qualitative analysis. Think of this as learning to see text the way an algorithm sees it.
+
+**What you'll do**:
+
+1. Create a corpus from simulated survey responses
+2. Tokenize text and build a document-feature matrix
+3. Explore word frequencies and keywords in context
+4. Try a simple dictionary-based sentiment approach
+
+**Prerequisites**: Week 1 completed, R and RStudio installed.
+
+---
+
+## Setup
+
+If this is your first time using quanteda, the install may take a few minutes. These are the main packages for text analysis in R.
+
+```{r install-packages, eval=FALSE}
+# Run once to install (skip if already installed)
+install.packages("quanteda")
+install.packages("quanteda.textstats")
+install.packages("quanteda.textplots")
+install.packages("tidyverse")
+```
+
+```{r load-packages}
+library(quanteda)
+library(quanteda.textstats)
+library(quanteda.textplots)
+library(tidyverse)
+
+set.seed(2024)
+```
+
+```{r verify-setup}
+pkgs <- c("quanteda", "quanteda.textstats", "quanteda.textplots", "tidyverse")
+loaded <- sapply(pkgs, requireNamespace, quietly = TRUE)
+
+if (all(loaded)) {
+  cat("All packages loaded successfully! You're ready to go.\n")
+  cat("quanteda version:", as.character(packageVersion("quanteda")), "\n")
+} else {
+  cat("Missing packages:", paste(pkgs[!loaded], collapse = ", "), "\n")
+  cat("Run the install chunk above first.\n")
+}
+```
+
+---
+
+## Create a Sample Corpus
+
+Imagine you ran a study on body image and included an open-ended question: *"How do you feel about your body most days?"* Below are 20 simulated responses that reflect the range you might actually see --- some body-positive, some body-negative, and some neutral or mixed.
+
+Each response has been manually coded for sentiment, the way a research assistant might do it in a qualitative study.
+
+```{r create-data}
+body_image_responses <- tibble(
+  id = 1:20,
+  response_text = c(
+    "I feel pretty good about my body most of the time. I try to focus on what it can do.",
+    "I hate looking in the mirror. My weight is always on my mind.",
+    "Some days are better than others. I don't think about my body that much.",
+    "I love how strong I feel after working out. My body is capable of amazing things.",
+    "I constantly compare myself to people on Instagram. I never feel thin enough.",
+    "My body is fine I guess. It's just a body.",
+    "I feel disgusted when I see my reflection. I wish I could change everything.",
+    "I appreciate my body for keeping me healthy. Appearance isn't everything.",
+    "I feel uncomfortable in my own skin most days. Clothes shopping is the worst.",
+    "I'm pretty neutral. I don't spend much time thinking about how I look.",
+    "I feel confident and happy with how I look. Self-acceptance has been a journey.",
+    "My weight makes me anxious. I skip meals sometimes to feel more in control.",
+    "I don't really have strong feelings about my body either way.",
+    "I've learned to appreciate my body even though it doesn't match beauty standards.",
+    "I feel fat and ugly every single day. I avoid social situations because of it.",
+    "My body lets me do the things I enjoy. That's what matters to me.",
+    "I obsess over my appearance constantly. It takes up so much mental energy.",
+    "I feel okay. Not great, not terrible. Just normal.",
+    "I'm grateful for my body. It carried me through a lot.",
+    "I can't stand how I look. I've tried every diet and nothing works."
+  ),
+  sentiment = c(
+    "positive", "negative", "neutral", "positive", "negative",
+    "neutral", "negative", "positive", "negative", "neutral",
+    "positive", "negative", "neutral", "positive", "negative",
+    "positive", "negative", "neutral", "positive", "negative"
+  )
+)
+
+body_image_responses %>%
+  count(sentiment) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+```
+
+> **Why simulated data?** Working with real participant text raises IRB and privacy concerns. Simulated responses let you learn the techniques without those complications. The patterns here are realistic enough to illustrate the core concepts.
+
+---
+
+## Step 1: Create a Corpus
+
+A **corpus** is quanteda's term for a structured collection of texts. Think of it as the container that holds all your documents along with metadata about each one.
+
+```{r create-corpus}
+# Create a quanteda corpus from the response text
+body_corpus <- corpus(body_image_responses,
+                      docid_field = "id",
+                      text_field = "response_text")
+
+# Attach the sentiment as a document-level variable
+docvars(body_corpus, "sentiment") <- body_image_responses$sentiment
+
+# See a summary of the corpus
+summary(body_corpus, n = 5)
+```
+
+Notice that quanteda tracks the number of tokens (words), types (unique words), and sentences for each document automatically. With 20 responses this is trivial, but the same code works on 20,000.
+
+---
+
+## Step 2: Tokenize
+
+**Tokenization** means breaking text into individual units --- usually words. This is the most fundamental step in NLP. A computer cannot "read" a sentence; it needs the sentence broken into discrete pieces it can count and compare.
+
+```{r tokenize}
+# Tokenize: break each response into individual words
+body_tokens <- tokens(body_corpus)
+
+# Look at what tokenization produces for the first response
+head(body_tokens, 3)
+```
+
+The raw tokens include punctuation, numbers, and common words like "I", "the", and "my" that appear in almost every response. These **stopwords** add noise without adding meaning for most analyses. Let's clean them up.
+
+```{r clean-tokens}
+# Remove punctuation, numbers, and stopwords
+body_tokens_clean <- tokens(body_corpus,
+                            remove_punct = TRUE,
+                            remove_numbers = TRUE) %>%
+  tokens_remove(stopwords("en"))
+
+# Compare the first response before and after cleaning
+cat("Before cleaning:\n")
+print(body_tokens[[1]])
+cat("\nAfter cleaning:\n")
+print(body_tokens_clean[[1]])
+```
+
+> **Pause and reflect**: Look at what was removed. Words like "I", "my", "about", and "the" are gone. What remains are the **content words** --- the words that carry meaning. This is a deliberate tradeoff: you lose some nuance (the difference between "I feel good" and "I don't feel good" can disappear with stopword removal) but you gain the ability to focus on meaningful patterns across many documents.
+
+---
+
+## Step 3: Document-Feature Matrix (DFM)
+
+A **document-feature matrix** is the core data structure in computational text analysis. Each row is a document (one survey response). Each column is a feature (a unique word). Each cell counts how many times that word appears in that document.
+
+This is how text becomes numbers --- and once you have numbers, you can do statistics.
+
+```{r create-dfm}
+# Create a document-feature matrix
+body_dfm <- dfm(body_tokens_clean)
+
+# Look at the dimensions
+cat("Documents:", nrow(body_dfm), "\n")
+cat("Unique features (words):", ncol(body_dfm), "\n")
+
+# Look at a portion of the matrix
+body_dfm[1:5, 1:8]
+```
+
+Each cell shows a count. A 1 means that word appeared once in that document; a 0 means it did not appear. Most cells are 0 --- text data is very **sparse**, meaning any given document uses only a small fraction of the total vocabulary. This sparsity is one of the key challenges in NLP.
+
+---
+
+## Step 4: Word Frequency
+
+The simplest and most informative starting point: which words appear most often across all responses?
+
+```{r word-frequency}
+# Get word frequencies across the full corpus
+word_freq <- textstat_frequency(body_dfm, n = 15)
+
+word_freq %>%
+  select(feature, frequency, docfreq)
+```
+
+```{r frequency-plot, fig.width=7, fig.height=5}
+# Visualize the top 15 words
+word_freq %>%
+  ggplot(aes(x = reorder(feature, frequency), y = frequency)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Most Frequent Words in Body Image Responses",
+    subtitle = "After removing stopwords and punctuation",
+    x = NULL,
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+> **What do you notice?** Words like "body", "feel", and "look" dominate. This makes sense given the survey question. But notice that frequency alone does not tell you whether a word is positive or negative. "Feel" appears in both "I feel great" and "I feel disgusted." This is a fundamental limitation of bag-of-words approaches --- they ignore context and word order.
+
+---
+
+## Step 5: Keyword Analysis
+
+The `kwic()` function (keyword in context) lets you search for specific terms and see the surrounding words. This is like a computational version of searching through interview transcripts --- but it scales to thousands of documents in seconds.
+
+Note: the KWIC calls below use `body_tokens` (the uncleaned tokens), not `body_tokens_clean`. This is intentional --- you want the surrounding stopwords and punctuation preserved so you can read the keyword in its natural context. If we used the cleaned tokens, you'd see fragmented text that's harder to interpret.
+
+```{r kwic-body}
+# Search for "body" in context (using uncleaned tokens for readable context)
+kwic(body_tokens, pattern = "body") %>%
+  as_tibble() %>%
+  select(docname, pre, keyword, post)
+```
+
+```{r kwic-weight}
+# Search for weight-related terms
+kwic(body_tokens, pattern = c("weight", "thin", "fat")) %>%
+  as_tibble() %>%
+  select(docname, pre, keyword, post)
+```
+
+```{r kwic-appearance}
+# Search for appearance-related terms
+kwic(body_tokens, pattern = c("appearance", "look", "mirror", "reflection")) %>%
+  as_tibble() %>%
+  select(docname, pre, keyword, post)
+```
+
+> **Scaling qualitative analysis**: Imagine you had 2,000 survey responses instead of 20. Reading each one would take days. KWIC lets you instantly find every mention of a concept and see it in context. This does not replace close reading, but it gives you a powerful starting point for identifying patterns and selecting responses for deeper analysis.
+
+---
+
+## Step 6: Simple Dictionary-Based Sentiment
+
+One step beyond word counts: you can create a **dictionary** that maps words to categories, then count how many words from each category appear in each document. This is a simple, transparent form of sentiment analysis.
+
+```{r create-dictionary}
+# Create a custom body image sentiment dictionary
+body_image_dict <- dictionary(list(
+  positive = c("good", "love", "strong", "capable", "appreciate",
+               "healthy", "confident", "happy", "acceptance",
+               "grateful", "enjoy", "amazing"),
+  negative = c("hate", "disgusted", "uncomfortable", "anxious",
+               "obsess", "ugly", "fat", "compare", "skip",
+               "avoid", "wish", "worst", "never")
+))
+
+body_image_dict
+```
+
+```{r apply-dictionary}
+# Apply the dictionary to the DFM
+sentiment_dfm <- dfm_lookup(body_dfm, dictionary = body_image_dict)
+
+# Convert to a data frame for easier viewing
+sentiment_scores <- convert(sentiment_dfm, to = "data.frame") %>%
+  rename(doc_id = doc_id) %>%
+  mutate(
+    dictionary_sentiment = case_when(
+      positive > negative ~ "positive",
+      negative > positive ~ "negative",
+      TRUE ~ "neutral"
+    )
+  )
+
+# Compare dictionary coding to manual coding
+comparison <- sentiment_scores %>%
+  bind_cols(body_image_responses %>% select(manual = sentiment))
+
+comparison %>%
+  select(doc_id, positive, negative, dictionary_sentiment, manual)
+```
+
+```{r dictionary-accuracy}
+# How well did the dictionary match manual coding?
+agreement <- comparison %>%
+  summarize(
+    total = n(),
+    matches = sum(dictionary_sentiment == manual),
+    accuracy = round(matches / total * 100, 1)
+  )
+
+cat("Dictionary matched manual coding", agreement$accuracy, "% of the time.\n")
+```
+
+> **Limitations to keep in mind**: Dictionary-based approaches are simple and transparent, which is good. But they have real limitations: they miss negation ("I don't feel good" gets coded as positive because of "good"), they miss words not in the dictionary, and they ignore context entirely. For research applications, validated dictionaries like the LIWC (Linguistic Inquiry and Word Count) are more robust, but they share the same fundamental limitations. When you need to capture meaning that depends on context, word order, or subtle phrasing, you need more sophisticated NLP methods.
+
+---
+
+## Reflection
+
+Take a moment to think about what you just did:
+
+1. **You turned text into numbers.** The document-feature matrix is the bridge between qualitative data and quantitative analysis. Every NLP method, from simple word counts to large language models, starts from this basic idea.
+
+2. **You scaled up qualitative exploration.** KWIC and word frequency analysis let you find patterns across many documents quickly --- something that would take hours or days by hand.
+
+3. **You tried dictionary-based sentiment analysis.** This is the simplest form of automated text classification, and you saw both its utility and its limits.
+
+**Questions to sit with**:
+
+- Where in your own research do you work with open-ended text data?
+- What would you gain from being able to analyze hundreds or thousands of text responses computationally?
+- Where did the dictionary approach fall short? What kind of meaning would require a more sophisticated method to capture?
+
+---
+
+## What's Next
+
+This notebook gave you a foundation in computational text analysis. From here, there are several directions you can go:
+
+- **quanteda documentation** (https://quanteda.io): The full package documentation, including topic models, text scaling, and more advanced dictionary approaches.
+- **Supervised Machine Learning for Text Analysis in R** (https://smltar.com): A free online book by Emil Hvitfeldt and Julia Silge that covers text classification, regression, and deep learning for text in R using tidymodels.
+- **Python orientation deep dive** (`python-orientation.md`): Transformer-based NLP models (like BERT and GPT) are primarily accessed through Python. When you are ready to move beyond bag-of-words approaches, the Python ecosystem is where the most powerful text analysis tools live.
+
+The gap between what you did here and what transformer models can do is large --- but the conceptual foundations (tokenization, representing text as numbers, mapping words to categories) are the same. You are building the right mental models.

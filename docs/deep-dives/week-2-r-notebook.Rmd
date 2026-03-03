@@ -1,0 +1,426 @@
+---
+title: "Your First ML Model: Predicting Body Dissatisfaction"
+subtitle: "AI/ML Crash Course — Week 2"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Welcome
+
+This notebook walks you through building your first machine learning model in R using **tidymodels** — a framework that will feel familiar if you already use the tidyverse.
+
+**What you'll do**:
+
+1. Meet a simulated psychology dataset
+2. Split data into training and test sets (the ML mindset)
+3. Build a logistic regression model the tidymodels way
+4. Evaluate how well the model performs
+5. Swap in a random forest model with minimal code changes
+6. Compare the two models
+
+**Prerequisites**: R and RStudio installed, basic familiarity with tidyverse.
+
+---
+
+## Step 1: Setup
+
+First, install and load the packages you need. If this is your first time using tidymodels, the install may take a few minutes.
+
+```{r install-packages, eval=FALSE}
+# Run this chunk ONCE to install packages (skip if already installed)
+install.packages("tidymodels")
+install.packages("tidyverse")
+install.packages("vip")    # for variable importance plots
+install.packages("ranger") # engine for random forest models
+```
+
+```{r load-packages}
+library(tidymodels)
+library(tidyverse)
+library(vip)
+
+# Set a random seed for reproducibility
+# (This ensures you get the same results each time you run the notebook)
+set.seed(2024)
+```
+
+### Test Your Setup
+
+Run this chunk first to verify everything is installed correctly. If you see "All packages loaded successfully!" then you're good to go. If you get an error, re-run the install chunk above.
+
+```{r test-setup}
+# Quick verification that all packages are available
+pkgs <- c("tidymodels", "tidyverse", "vip", "ranger")
+loaded <- sapply(pkgs, requireNamespace, quietly = TRUE)
+
+if (all(loaded)) {
+  cat("All packages loaded successfully! You're ready to go.\n")
+  cat("R version:", R.version.string, "\n")
+  cat("tidymodels version:", as.character(packageVersion("tidymodels")), "\n")
+} else {
+  cat("Missing packages:", paste(pkgs[!loaded], collapse = ", "), "\n")
+  cat("Run: install.packages(c('", paste(pkgs[!loaded], collapse = "', '"), "'))\n")
+}
+```
+
+> **What is tidymodels?** It's a collection of R packages for machine learning that follows tidyverse principles. If you know dplyr and ggplot2, the syntax will feel familiar. It's the recommended way to do ML in R.
+
+---
+
+## Step 2: Meet Your Data
+
+We're going to create a simulated dataset that mirrors what you might actually work with. The scenario: **predicting which adolescents will develop clinically significant body dissatisfaction** based on risk and protective factors.
+
+```{r simulate-data}
+n <- 500
+
+body_image_data <- tibble(
+  # Participant ID
+  id = 1:n,
+
+  # Age in years (12-17)
+  age = round(runif(n, 12, 17), 1),
+
+  # Daily social media hours (0-8, right-skewed)
+  social_media_hours = round(pmax(0, rnorm(n, 2.5, 1.5)), 1),
+
+  # Appearance-focused content exposure (1-10 scale)
+  appearance_content = round(pmin(10, pmax(1, rnorm(n, 5, 2))), 1),
+
+  # Maternal body talk frequency (1-7 scale, higher = more comments about bodies)
+  maternal_body_talk = round(pmin(7, pmax(1, rnorm(n, 3.5, 1.2))), 1),
+
+  # Maternal warmth (1-7 scale)
+  maternal_warmth = round(pmin(7, pmax(1, rnorm(n, 4.5, 1.0))), 1),
+
+  # Peer appearance pressure (1-10 scale)
+  peer_pressure = round(pmin(10, pmax(1, rnorm(n, 4, 2))), 1),
+
+  # Self-esteem (1-7 scale)
+  self_esteem = round(pmin(7, pmax(1, rnorm(n, 4.2, 1.1))), 1),
+
+  # BMI percentile (5-99)
+  bmi_percentile = round(pmin(99, pmax(5, rnorm(n, 55, 20))))
+)
+
+# Create the outcome variable: clinical body dissatisfaction (yes/no)
+# This simulates a realistic pattern where multiple risk factors combine
+body_image_data <- body_image_data %>%
+  mutate(
+    # Create a risk score with NONLINEAR effects and interactions
+    # This is more realistic — risk factors don't always combine linearly
+    risk_score = 0.3 * social_media_hours +
+                 0.25 * appearance_content +
+                 0.35 * maternal_body_talk +
+                 -0.2 * maternal_warmth +
+                 -0.3 * self_esteem +
+                 0.01 * bmi_percentile +
+                 # Interaction: social media exposure is especially risky
+                 # when combined with appearance-focused content
+                 0.15 * social_media_hours * (appearance_content / 10) +
+                 # Threshold effect: peer pressure has a sharp jump above 7
+                 # (think of it like a tipping point — moderate pressure is
+                 # manageable, but high pressure overwhelms coping resources)
+                 ifelse(peer_pressure > 7, 1.2, 0.1 * peer_pressure) +
+                 rnorm(n, 0, 1.2),  # noise
+
+    # Convert to probability and then binary outcome
+    prob = plogis(risk_score - 3.5),
+    clinical_dissatisfaction = factor(
+      ifelse(rbinom(n, 1, prob) == 1, "Yes", "No"),
+      levels = c("No", "Yes")
+    )
+  ) %>%
+  # Remove the intermediate variables
+  select(-risk_score, -prob)
+```
+
+Let's look at what we created:
+
+```{r explore-data}
+# Quick overview
+glimpse(body_image_data)
+```
+
+```{r outcome-distribution}
+# How many adolescents have clinical body dissatisfaction?
+body_image_data %>%
+  count(clinical_dissatisfaction) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+```
+
+> **Pause and reflect**: Look at the variables. These are the **features** (predictor variables) that the model will learn from. The **label** (outcome variable) is `clinical_dissatisfaction`. This is a **classification** problem — we're predicting a category (Yes/No), not a continuous number.
+
+---
+
+## Step 3: The ML Mindset — Train/Test Split
+
+Here's the fundamental principle of machine learning evaluation: **never evaluate your model on the same data it learned from.**
+
+Why? Because a model can always memorize its training data and look great — but that doesn't mean it will work on new patients. This is the **overfitting** problem you read about in Week 1.
+
+The solution: split your data into two parts.
+
+```{r split-data}
+# Split the data: 75% for training, 25% for testing
+data_split <- initial_split(body_image_data, prop = 0.75, strata = clinical_dissatisfaction)
+
+# Create the training and test sets
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cat("Training set:", nrow(train_data), "participants\n")
+cat("Test set:    ", nrow(test_data), "participants\n")
+```
+
+> **What just happened?** `initial_split()` randomly divided the data into a training set (75%) and a test set (25%). The `strata` argument ensures both sets have similar proportions of Yes/No outcomes. The model will ONLY learn from the training set. The test set is locked away for final evaluation.
+>
+> **Psychology analogy**: This is exactly the logic of cross-validation in scale development. You wouldn't report internal consistency from the same sample you used to select items — that would inflate your estimates.
+
+---
+
+## Step 4: Your First Model — Logistic Regression
+
+Let's build a logistic regression model. You already know logistic regression from your statistics training. Here, we'll do it the tidymodels way — which introduces a structure that makes it easy to swap in other algorithms later.
+
+The tidymodels workflow has three steps: **Recipe** → **Model Specification** → **Workflow**.
+
+### Step 4a: Create a Recipe
+
+A recipe defines how to prepare your data for modeling. Think of it as your data preprocessing pipeline.
+
+```{r recipe}
+# Define the recipe: predict clinical_dissatisfaction from all other variables (except id)
+body_image_recipe <- recipe(clinical_dissatisfaction ~ ., data = train_data) %>%
+  update_role(id, new_role = "ID") %>%  # Don't use ID as a predictor
+  step_normalize(all_numeric_predictors())  # Standardize numeric predictors
+
+body_image_recipe
+```
+
+> **What this does**: We told the recipe that `clinical_dissatisfaction` is the outcome, everything else (except `id`) is a predictor, and numeric predictors should be standardized (like z-scoring). This is similar to the data prep you do before running any analysis.
+
+### Step 4b: Specify the Model
+
+```{r logistic-spec}
+# Specify a logistic regression model
+logistic_spec <- logistic_reg() %>%
+  set_engine("glm") %>%       # Use the familiar glm engine
+  set_mode("classification")   # We're classifying, not doing regression
+
+logistic_spec
+```
+
+> **Notice anything familiar?** `set_engine("glm")` means we're using the exact same GLM engine you've used with `glm()` in R. Same math, just wrapped in the tidymodels structure.
+
+### Step 4c: Create and Fit the Workflow
+
+```{r logistic-workflow}
+# Combine the recipe and model into a workflow
+logistic_wf <- workflow() %>%
+  add_recipe(body_image_recipe) %>%
+  add_model(logistic_spec)
+
+# Fit the model on the TRAINING data
+logistic_fit <- logistic_wf %>%
+  fit(data = train_data)
+
+# Look at the model coefficients (just like regular logistic regression!)
+logistic_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+> **Pause and reflect**: Look at those coefficients. They're the same kind of output you'd get from `glm()`. Positive coefficients increase the probability of clinical dissatisfaction; negative ones decrease it. You already know how to interpret this.
+
+---
+
+## Step 5: How Did We Do?
+
+Now the critical step: evaluate the model on the **test data** — data it has never seen before.
+
+```{r logistic-predictions}
+# Make predictions on the test set
+logistic_predictions <- logistic_fit %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction))
+
+# Look at the first few predictions
+head(logistic_predictions)
+```
+
+```{r confusion-matrix}
+# Confusion matrix: predictions vs. reality
+logistic_predictions %>%
+  conf_mat(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+> **Reading the confusion matrix**: The rows are what the model predicted; the columns are the truth. The diagonal (top-left and bottom-right) are correct predictions. Off-diagonal cells are errors. Top-right = false positives (flagged as dissatisfied when they're not). Bottom-left = false negatives (missed actual dissatisfied adolescents).
+
+```{r logistic-metrics}
+# Calculate key metrics
+# Note: metrics() returns accuracy and kappa (Cohen's kappa) by default.
+# Sensitivity and specificity are computed separately in the next chunk.
+logistic_metrics <- logistic_predictions %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class)
+
+logistic_metrics
+```
+
+```{r logistic-detailed}
+# More detailed metrics: sensitivity (recall) and specificity
+logistic_predictions %>%
+  sensitivity(truth = clinical_dissatisfaction, estimate = .pred_class)
+
+logistic_predictions %>%
+  specificity(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+> **Interpreting the results**:
+>
+> - **Accuracy**: Overall percentage of correct predictions
+> - **Sensitivity** (recall): Of all adolescents who actually had clinical dissatisfaction, what percentage did we correctly identify?
+> - **Specificity**: Of all adolescents who did NOT have clinical dissatisfaction, what percentage did we correctly classify?
+>
+> **Psychology translation**: Sensitivity is like the sensitivity of a screening measure — how good is it at catching true cases? Specificity is like specificity of a diagnostic test — how good is it at ruling out non-cases?
+
+---
+
+## Step 6: Now Try a "Real" ML Model — Random Forest
+
+Here's the magic of tidymodels: swapping in a completely different algorithm requires changing just **a few lines of code**. Everything else — the recipe, the evaluation — stays the same.
+
+```{r rf-spec}
+# Specify a random forest model
+rf_spec <- rand_forest(trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_spec
+```
+
+```{r rf-workflow}
+# Create a new workflow with the random forest
+rf_wf <- workflow() %>%
+  add_recipe(body_image_recipe) %>%
+  add_model(rf_spec)
+
+# Fit on training data
+rf_fit <- rf_wf %>%
+  fit(data = train_data)
+```
+
+```{r rf-predictions}
+# Predict on test data
+rf_predictions <- rf_fit %>%
+  predict(test_data) %>%
+  bind_cols(test_data %>% select(clinical_dissatisfaction))
+
+# Confusion matrix
+rf_predictions %>%
+  conf_mat(truth = clinical_dissatisfaction, estimate = .pred_class)
+```
+
+```{r rf-metrics}
+# Calculate metrics
+rf_metrics <- rf_predictions %>%
+  metrics(truth = clinical_dissatisfaction, estimate = .pred_class)
+
+rf_metrics
+```
+
+### Compare the Two Models
+
+```{r compare-models}
+# Side-by-side comparison
+bind_rows(
+  logistic_metrics %>% mutate(model = "Logistic Regression"),
+  rf_metrics %>% mutate(model = "Random Forest")
+) %>%
+  select(model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  knitr::kable(digits = 3)
+```
+
+> **What to notice**: Because our simulated data includes nonlinear effects (the social media × appearance content interaction and the peer pressure threshold), the random forest should outperform logistic regression here. The random forest can capture these nonlinear patterns automatically, while logistic regression assumes linear relationships. In real research, when relationships are complex and interactive, ML models often have an edge — and you now know how to try both and compare.
+
+### Variable Importance
+
+One of the most useful things about random forests: they tell you which variables mattered most for prediction.
+
+```{r variable-importance, fig.width=7, fig.height=5}
+# Variable importance plot
+rf_fit %>%
+  extract_fit_parsnip() %>%
+  vip(num_features = 8) +
+  labs(
+    title = "Which Variables Best Predict Clinical Body Dissatisfaction?",
+    subtitle = "Random Forest Variable Importance",
+    x = "Variable",
+    y = "Importance"
+  ) +
+  theme_minimal()
+```
+
+> **Interpreting variable importance**: The taller the bar, the more that variable contributed to the model's ability to predict clinical body dissatisfaction. This is analogous to looking at standardized beta weights in regression — but it works even when the relationships are nonlinear and interactive.
+>
+> **Research implication**: Variable importance can reveal which risk factors are most predictive — potentially identifying the best targets for intervention. This is the kind of actionable insight that makes ML valuable for clinical research.
+
+---
+
+## Reflection
+
+Take a few minutes to think about what you just did:
+
+1. **You built two ML models.** A logistic regression (which you already knew) and a random forest (which is new). Notice how similar the process was — that's intentional.
+
+2. **You evaluated them on held-out data.** This is the core ML discipline — testing on unseen data to get honest performance estimates.
+
+3. **You compared algorithms.** With tidymodels, trying a different algorithm is a small code change, not starting from scratch.
+
+4. **You interpreted variable importance.** Knowing which variables matter most isn't just a statistical exercise — it has clinical and theoretical implications.
+
+**Questions to sit with**:
+
+- If you replaced this simulated data with real data from your research, which variables would you include as features?
+- What would you want the model to predict — a diagnostic category? A continuous severity score? Risk of future onset?
+- Who would need to see and trust the results? Clinicians? School counselors? Parents? How would that shape your choice of a model that's interpretable (logistic regression) vs. one that might be more accurate but harder to explain (random forest)?
+- What ethical considerations would come up in applying a predictive model to adolescent body image in practice?
+
+---
+
+## What's Next
+
+You've run your first ML models. In Week 3, you'll learn how to talk about this experience in job applications, research statements, and interviews — positioning yourself as someone who can bridge psychology and AI/ML.
+
+**Bonus challenge**: Try modifying the code above to predict a different outcome or add new features. Change the simulated data, add interaction effects, or try a different algorithm. Tidymodels makes experimentation low-cost.
+
+---
+
+## Optional Bonus: Cross-Validation Preview
+
+In the main notebook, we used a single train/test split to evaluate our models. But what if we got unlucky with which data ended up in the test set? **Cross-validation** addresses this by splitting the data multiple times and averaging the results.
+
+This is a brief preview — for a full walkthrough, see `deep-dives/cross-validation-in-practice.Rmd`.
+
+```{r cv-preview, eval=FALSE}
+# 10-fold cross-validation: split data into 10 parts, train on 9, test on 1, rotate
+cv_folds <- vfold_cv(train_data, v = 10, strata = clinical_dissatisfaction)
+
+# Fit the random forest on each fold and collect metrics
+rf_cv_results <- rf_wf %>%
+  fit_resamples(
+    resamples = cv_folds,
+    metrics = metric_set(accuracy, sensitivity, specificity)
+  )
+
+# See the averaged performance across all 10 folds
+collect_metrics(rf_cv_results)
+```
+
+> **Why this matters**: A single train/test split gives you one estimate of performance. Cross-validation gives you a more stable, trustworthy estimate by averaging across multiple splits. It's considered best practice in ML research. If you want to report model performance in a paper, reviewers will expect cross-validation.
+>
+> **Want to go deeper?** See the deep dive on cross-validation: `deep-dives/cross-validation-explained.md` for the concepts, and `deep-dives/cross-validation-in-practice.Rmd` for the full hands-on walkthrough.
